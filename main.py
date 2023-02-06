@@ -7,7 +7,6 @@ import smtplib
 
 keyword = "你想爬的ptt文章標題"
 save = []
-j = 0
 
 def get(url):
     response = requests.get(url)
