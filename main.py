@@ -9,8 +9,8 @@ import smtplib
 keyword = ""                        # 文章標題關鍵字
 save = set()                        # 儲存已經發送過的文章標題
 ptt_url = ""                        # PTT URL
-sender_email = ""                   # 寄件者 Email
-receiver_emails = ["", ""]          # 收件者 Email
+sender_email = "example@gmail.com"                   # 寄件者 Email
+receiver_emails = ["example@gmail.com", "example2@gmail.com"]          # 收件者 Email
 app_password = ""                   # Google 應用程式密碼
 check_interval = 60                 # 檢查間隔時間 (秒)
 
@@ -54,7 +54,7 @@ def fetch_titles():
 
     for title in titles:
         title_text = title.text.strip()
-        if keyword.lower() in title_text.lower() and title_text.lower() not in save:
+        if keyword.lower() in title_text.lower() and title_text not in save:
             save.add(title_text)
             link = title.select_one("a").get("href")
             full_link = f"https://www.ptt.cc{link}"
