@@ -5,62 +5,78 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import smtplib
 
-keyword = "你想爬的ptt文章標題"
-save = []
+# 設定參數
+keyword = ""                        # 文章標題關鍵字
+save = set()                        # 儲存已經發送過的文章標題
+ptt_url = ""                        # PTT URL
+sender_email = ""                   # 寄件者 Email
+receiver_emails = ["", ""]          # 收件者 Email
+app_password = ""                   # Google 應用程式密碼
+check_interval = 60                 # 檢查間隔時間 (秒)
 
 def get(url):
-    response = requests.get(url)
-    return response
+    """取得 URL 的回應."""
+    try:
+        response = requests.get(url)
+        response.raise_for_status()  # 若失敗則拋出錯誤
+        return response
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching data from {url}: {e}")
+        return None
 
-def send_email(msg):
-    content = MIMEMultipart()  # 建立MIMEMultipart物件
-    content["subject"] = "搜尋到" + str(len(href))+ "篇【 "+keyword+" 】相關標題文章" # 郵件標題
-    content["from"] = ""  # 寄件者
-    content["to"] = "email1, email2, ..."  # 收件者
-    content.attach(MIMEText(msg))  # 郵件內容
-    pwd = '' # 你的google應用程式密碼
-    with smtplib.SMTP(host="smtp.gmail.com", port="587") as smtp:  # 設定SMTP伺服器
-        try:
-            smtp.ehlo()  # 驗證SMTP伺服器
-            smtp.starttls()  # 建立加密傳輸
-            smtp.login("your mail", pwd)  # 登入寄件者gmail
-            smtp.send_message(content)  # 寄送郵件
-            print("Complete!")
-        except Exception as e:
-            print("Error message: ", e)    
+def send_email(subject, msg):
+    """寄送通知信件."""
+    content = MIMEMultipart()
+    content["subject"] = subject
+    content["from"] = sender_email
+    content["to"] = ", ".join(receiver_emails)
+    content.attach(MIMEText(msg))
 
+    try:
+        with smtplib.SMTP(host="smtp.gmail.com", port="587") as smtp:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.login(sender_email, app_password)
+            smtp.send_message(content)
+            print("Email sent successfully!")
+    except smtplib.SMTPException as e:
+        print(f"Error sending email: {e}")
 
+def fetch_titles():
+    """抓取 PTT 文章標題及連結."""
+    response = get(ptt_url)
+    if response is None:
+        return []
 
-while (True) :
-    chose = []
-    response = requests.get("url")    # ptt url
-    soup = BeautifulSoup(response.text, "html.parser") # 解析原始碼
-    num = soup.find_all("div", class_="nrec") # 抓文章前面的數字
-    title = soup.find_all("div", class_="title") # 抓文章標題 
-    href =[]
+    soup = BeautifulSoup(response.text, "html.parser")
+    titles = soup.find_all("div", class_="title")
+    new_posts = []
 
-    for list in title:
+    for title in titles:
+        title_text = title.text.strip()
+        if keyword.lower() in title_text.lower() and title_text.lower() not in save:
+            save.add(title_text)
+            link = title.select_one("a").get("href")
+            full_link = f"https://www.ptt.cc{link}"
+            new_posts.append((title_text, full_link))
 
-        if ((list.text.strip()).find(keyword) != -1) :    
-            
-            if list.text.strip() not in save : #如果save陣列沒有該值
-                
-                save.append(list.text.strip()) #存進save陣列
-                chose.append(list.text.strip()) #把符合的標題存入陣列
-                item_href = list.select_one("a").get("href")
-                href.append(item_href)
+    return new_posts
 
-    if chose != []:
-        msg =""
-        for address in range(len(href)):    
-            msg = msg+"【 "+keyword+" 】關鍵字有新文章\n 給你連結，趕快去看\n https://www.ptt.cc/"+href[address]+"\n\n"
+def main():
+    while True:
+        new_posts = fetch_titles()
+        if new_posts:
+            msg = "\n\n".join([f"【{keyword}】關鍵字新文章：{title}\n連結：{link}" for title, link in new_posts])
+            subject = f"搜尋到 {len(new_posts)} 篇【{keyword}】相關標題文章"
+            print(msg)
+            send_email(subject, msg)
 
-        print(msg)
-        send_email(msg)
+        # 打印時間戳
+        print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
+        print("----------------------------------------")
 
-    localtime = time.localtime()
-    result = time.strftime("%Y-%m-%d %I:%M:%S %p", localtime)
-    print(result)
-    print("----------------------------------------")
+        # 等待下次檢查
+        time.sleep(check_interval)
 
-    time.sleep(900)
+if __name__ == "__main__":
+    main()
