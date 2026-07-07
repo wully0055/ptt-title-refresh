@@ -1,4 +1,4 @@
-"""定時爬取 PTT 看板，標題符合關鍵字時寄 Email 通知。"""
+"""定時爬取 PTT 看板，依監控清單（watches.json）比對關鍵字並寄 Email 通知。"""
 
 import html as html_lib
 import json
@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 PTT_BASE_URL = "https://www.ptt.cc"
 DEFAULT_CHECK_INTERVAL_SECONDS = 900  # 15 分鐘
 DEFAULT_SEEN_POSTS_FILE = "seen_posts.json"
+DEFAULT_WATCHES_FILE = "watches.json"
+WATCH_MODES = ("any", "all")
 
 logger = logging.getLogger(__name__)
 
@@ -30,17 +32,14 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class Config:
-    ptt_url: str
-    keyword: str
     sender_email: str
     receiver_emails: list[str]
     gmail_app_password: str
     check_interval_seconds: int
     seen_posts_file: Path
+    watches_file: Path
 
     REQUIRED_KEYS = (
-        "PTT_URL",
-        "KEYWORD",
         "SENDER_EMAIL",
         "RECEIVER_EMAILS",
         "GMAIL_APP_PASSWORD",
@@ -61,8 +60,6 @@ class Config:
         ]
 
         return cls(
-            ptt_url=env["PTT_URL"].strip(),
-            keyword=env["KEYWORD"].strip(),
             sender_email=env["SENDER_EMAIL"].strip(),
             receiver_emails=receiver_emails,
             gmail_app_password=env["GMAIL_APP_PASSWORD"].strip(),
@@ -72,7 +69,60 @@ class Config:
             seen_posts_file=Path(
                 env.get("SEEN_POSTS_FILE", DEFAULT_SEEN_POSTS_FILE)
             ),
+            watches_file=Path(env.get("WATCHES_FILE", DEFAULT_WATCHES_FILE)),
         )
+
+
+@dataclass(frozen=True)
+class Watch:
+    """一個監控項目：在哪個頁面、比對哪些關鍵字。"""
+
+    url: str
+    keywords: list[str]
+    mode: str = "any"  # any = 任一關鍵字命中；all = 全部關鍵字都要出現
+    name: str = ""
+
+
+def load_watches(path: Path) -> list["Watch"]:
+    """讀取並驗證監控清單，格式錯誤時拋出 ConfigError。"""
+    path = Path(path)
+    if not path.exists():
+        raise ConfigError(
+            f"找不到監控清單 {path}（請參考 watches.example.json 建立）"
+        )
+
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"{path} 不是合法的 JSON：{e}") from e
+
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError(f"{path} 必須是至少一個監控項目的清單")
+
+    watches = []
+    for index, entry in enumerate(entries, start=1):
+        url = str(entry.get("url", "")).strip()
+        if not url:
+            raise ConfigError(f"{path} 第 {index} 個項目缺少 url")
+
+        keywords = [
+            str(keyword).strip()
+            for keyword in entry.get("keywords", [])
+            if str(keyword).strip()
+        ]
+        if not keywords:
+            raise ConfigError(f"{path} 第 {index} 個項目缺少 keywords")
+
+        mode = entry.get("mode", "any")
+        if mode not in WATCH_MODES:
+            raise ConfigError(
+                f"{path} 第 {index} 個項目的 mode 必須是 {WATCH_MODES}，收到 {mode!r}"
+            )
+
+        name = str(entry.get("name", "")).strip() or "＋".join(keywords)
+        watches.append(Watch(url=url, keywords=keywords, mode=mode, name=name))
+
+    return watches
 
 
 class SeenStore:
@@ -107,11 +157,15 @@ class SeenStore:
             )
 
 
-def parse_posts(html: str, keyword: str) -> list[tuple[str, str]]:
-    """解析看板頁面，回傳標題含關鍵字的 (標題, 完整連結) 清單。
+def match_title(title: str, keywords: list[str], mode: str) -> bool:
+    """標題是否命中關鍵字（不分大小寫）。any = 任一；all = 全部。"""
+    title_lower = title.lower()
+    hits = (keyword.lower() in title_lower for keyword in keywords)
+    return all(hits) if mode == "all" else any(hits)
 
-    已刪除的文章（標題沒有連結）會被略過。
-    """
+
+def parse_posts(html: str) -> list[tuple[str, str]]:
+    """解析看板頁面，回傳所有 (標題, 完整連結)。已刪除的文章（沒有連結）會略過。"""
     soup = BeautifulSoup(html, "html.parser")
     posts = []
     for title_div in soup.find_all("div", class_="title"):
@@ -119,8 +173,7 @@ def parse_posts(html: str, keyword: str) -> list[tuple[str, str]]:
         if link is None:  # 已刪除的文章
             continue
         title = title_div.text.strip()
-        if keyword.lower() in title.lower():
-            posts.append((title, f"{PTT_BASE_URL}{link.get('href')}"))
+        posts.append((title, f"{PTT_BASE_URL}{link.get('href')}"))
     return posts
 
 
@@ -141,13 +194,13 @@ def board_from_url(url: str) -> str:
 
 
 def render_email(
-    keyword: str, posts: list[tuple[str, str]], checked_at: str
+    watch_name: str, posts: list[tuple[str, str]], checked_at: str
 ) -> tuple[str, str, str]:
     """產生通知信的 (主旨, 純文字內文, HTML 內文)。"""
-    subject = f"搜尋到 {len(posts)} 篇【{keyword}】相關標題文章"
+    subject = f"【{watch_name}】搜尋到 {len(posts)} 篇新文章"
 
     text = "\n\n".join(
-        f"【{keyword}】關鍵字新文章：{title}\n連結：{url}" for title, url in posts
+        f"【{watch_name}】新文章：{title}\n連結：{url}" for title, url in posts
     )
 
     cards = []
@@ -176,7 +229,7 @@ def render_email(
         'font-family:-apple-system,\'Segoe UI\',\'Microsoft JhengHei\',sans-serif;">'
         '<p style="margin:0 0 4px;font-size:13px;color:#8a8a85;">PTT 關鍵字通知</p>'
         f'<p style="margin:0 0 16px;font-size:17px;font-weight:500;color:#2c2c2a;">'
-        f"「{html_lib.escape(keyword)}」有 {len(posts)} 篇新文章</p>"
+        f"「{html_lib.escape(watch_name)}」有 {len(posts)} 篇新文章</p>"
         f"{''.join(cards)}"
         f'<p style="margin:16px 0 0;font-size:11px;color:#b4b2a9;">'
         f"ptt-title-refresh・{html_lib.escape(checked_at)}</p>"
@@ -212,28 +265,45 @@ def send_email(config: Config, subject: str, text_body: str, html_body: str) -> 
         )
 
 
-def check_once(config: Config, session: requests.Session, store: SeenStore) -> None:
-    html = fetch_page(session, config.ptt_url)
-    if html is None:
-        return
+def run_cycle(
+    config: Config,
+    watches: list[Watch],
+    session: requests.Session,
+    store: SeenStore,
+) -> None:
+    """跑一輪：每個 URL 只抓一次，逐一比對各監控項目並通知。"""
+    pages: dict[str, list[tuple[str, str]] | None] = {}
+    for url in {watch.url for watch in watches}:
+        html = fetch_page(session, url)
+        pages[url] = parse_posts(html) if html is not None else None
 
-    new_posts = [
-        (title, url)
-        for title, url in parse_posts(html, config.keyword)
-        if not store.is_seen(url)
-    ]
-    if not new_posts:
-        logger.info("本輪沒有新文章 keyword=%s", config.keyword)
-        return
+    notified = False
+    for watch in watches:
+        posts = pages[watch.url]
+        if posts is None:
+            continue
 
-    checked_at = time.strftime("%Y-%m-%d %H:%M")
-    subject, text_body, html_body = render_email(config.keyword, new_posts, checked_at)
-    logger.info("發現 %d 篇新文章：\n%s", len(new_posts), text_body)
-    send_email(config, subject, text_body, html_body)
+        new_posts = [
+            (title, url)
+            for title, url in posts
+            if match_title(title, watch.keywords, watch.mode)
+            and not store.is_seen(url)
+        ]
+        if not new_posts:
+            logger.info("「%s」本輪沒有新文章", watch.name)
+            continue
 
-    for _, url in new_posts:
-        store.add(url)
-    store.save()
+        checked_at = time.strftime("%Y-%m-%d %H:%M")
+        subject, text_body, html_body = render_email(watch.name, new_posts, checked_at)
+        logger.info("發現 %d 篇新文章：\n%s", len(new_posts), text_body)
+        send_email(config, subject, text_body, html_body)
+
+        for _, url in new_posts:
+            store.add(url)
+        notified = True
+
+    if notified:
+        store.save()
 
 
 def main() -> None:
@@ -245,6 +315,7 @@ def main() -> None:
     load_dotenv()
     try:
         config = Config.from_env(dict(os.environ))
+        watches = load_watches(config.watches_file)
     except ConfigError as e:
         logger.error("%s", e)
         sys.exit(1)
@@ -253,14 +324,18 @@ def main() -> None:
     session = requests.Session()
     session.cookies.set("over18", "1", domain=".ptt.cc")  # 18 禁看板的年齡確認
 
-    logger.info(
-        "開始監控 url=%s keyword=%s interval=%ds",
-        config.ptt_url,
-        config.keyword,
-        config.check_interval_seconds,
-    )
+    for watch in watches:
+        logger.info(
+            "監控項目「%s」 url=%s keywords=%s mode=%s",
+            watch.name,
+            watch.url,
+            watch.keywords,
+            watch.mode,
+        )
+    logger.info("每 %d 秒檢查一次", config.check_interval_seconds)
+
     while True:
-        check_once(config, session, store)
+        run_cycle(config, watches, session, store)
         time.sleep(config.check_interval_seconds)
 
 

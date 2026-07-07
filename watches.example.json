@@ -1,0 +1,18 @@
+[
+  {
+    "name": "五月天票券",
+    "url": "https://www.ptt.cc/bbs/Drama-Ticket/index.html",
+    "keywords": ["五月天", "MAYDAY"],
+    "mode": "any"
+  },
+  {
+    "name": "五月天徵票",
+    "url": "https://www.ptt.cc/bbs/Drama-Ticket/index.html",
+    "keywords": ["五月天", "徵求"],
+    "mode": "all"
+  },
+  {
+    "url": "https://www.ptt.cc/bbs/Ticket/index.html",
+    "keywords": ["周杰倫"]
+  }
+]

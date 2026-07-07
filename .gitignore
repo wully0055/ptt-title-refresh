@@ -5,6 +5,9 @@ path/
 # 環境變數（含密碼，不可 commit）
 .env
 
+# 個人的監控清單（範例見 watches.example.json）
+watches.json
+
 # 執行時產生的狀態檔
 seen_posts.json
 

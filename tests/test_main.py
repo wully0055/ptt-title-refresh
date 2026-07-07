@@ -2,13 +2,23 @@ import json
 
 import pytest
 
-from main import Config, ConfigError, SeenStore, parse_posts
+import main as main_mod
+from main import (
+    Config,
+    ConfigError,
+    SeenStore,
+    Watch,
+    board_from_url,
+    load_watches,
+    match_title,
+    parse_posts,
+    render_email,
+    run_cycle,
+)
 
 # --- Config ---
 
 REQUIRED_ENV = {
-    "PTT_URL": "https://www.ptt.cc/bbs/Drama-Ticket/index.html",
-    "KEYWORD": "五月天",
     "SENDER_EMAIL": "me@gmail.com",
     "RECEIVER_EMAILS": "a@gmail.com, b@gmail.com",
     "GMAIL_APP_PASSWORD": "secret",
@@ -18,8 +28,6 @@ REQUIRED_ENV = {
 def test_config_from_env_reads_all_fields():
     config = Config.from_env({**REQUIRED_ENV, "CHECK_INTERVAL_SECONDS": "60"})
 
-    assert config.ptt_url == REQUIRED_ENV["PTT_URL"]
-    assert config.keyword == "五月天"
     assert config.sender_email == "me@gmail.com"
     assert config.receiver_emails == ["a@gmail.com", "b@gmail.com"]
     assert config.gmail_app_password == "secret"
@@ -28,26 +36,138 @@ def test_config_from_env_reads_all_fields():
 
 def test_config_missing_required_keys_raises_with_names():
     env = {k: v for k, v in REQUIRED_ENV.items() if k != "GMAIL_APP_PASSWORD"}
-    env.pop("KEYWORD")
+    env.pop("SENDER_EMAIL")
 
     with pytest.raises(ConfigError) as exc_info:
         Config.from_env(env)
 
-    assert "KEYWORD" in str(exc_info.value)
+    assert "SENDER_EMAIL" in str(exc_info.value)
     assert "GMAIL_APP_PASSWORD" in str(exc_info.value)
 
 
 def test_config_blank_value_counts_as_missing():
     with pytest.raises(ConfigError) as exc_info:
-        Config.from_env({**REQUIRED_ENV, "KEYWORD": "  "})
+        Config.from_env({**REQUIRED_ENV, "SENDER_EMAIL": "  "})
 
-    assert "KEYWORD" in str(exc_info.value)
+    assert "SENDER_EMAIL" in str(exc_info.value)
 
 
 def test_config_check_interval_defaults_to_15_minutes():
     config = Config.from_env(REQUIRED_ENV)
 
     assert config.check_interval_seconds == 900
+
+
+def test_config_watches_file_defaults_to_watches_json():
+    config = Config.from_env(REQUIRED_ENV)
+
+    assert str(config.watches_file) == "watches.json"
+
+
+# --- Watches ---
+
+VALID_WATCHES = [
+    {
+        "name": "五月天票券",
+        "url": "https://www.ptt.cc/bbs/Drama-Ticket/index.html",
+        "keywords": ["五月天", "MAYDAY"],
+        "mode": "any",
+    },
+    {
+        "url": "https://www.ptt.cc/bbs/Ticket/index.html",
+        "keywords": ["周杰倫"],
+    },
+]
+
+
+def write_watches(tmp_path, data):
+    path = tmp_path / "watches.json"
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_load_watches_parses_valid_file(tmp_path):
+    watches = load_watches(write_watches(tmp_path, VALID_WATCHES))
+
+    assert watches[0] == Watch(
+        name="五月天票券",
+        url="https://www.ptt.cc/bbs/Drama-Ticket/index.html",
+        keywords=["五月天", "MAYDAY"],
+        mode="any",
+    )
+
+
+def test_load_watches_defaults_mode_to_any_and_name_to_keywords(tmp_path):
+    watches = load_watches(write_watches(tmp_path, VALID_WATCHES))
+
+    assert watches[1].mode == "any"
+    assert watches[1].name == "周杰倫"
+
+
+def test_load_watches_missing_file_raises(tmp_path):
+    with pytest.raises(ConfigError) as exc_info:
+        load_watches(tmp_path / "nope.json")
+
+    assert "nope.json" in str(exc_info.value)
+
+
+def test_load_watches_empty_list_raises(tmp_path):
+    with pytest.raises(ConfigError):
+        load_watches(write_watches(tmp_path, []))
+
+
+def test_load_watches_missing_url_raises_with_position(tmp_path):
+    data = [{"keywords": ["x"]}]
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_watches(write_watches(tmp_path, data))
+
+    assert "url" in str(exc_info.value)
+    assert "1" in str(exc_info.value)
+
+
+def test_load_watches_empty_keywords_raises(tmp_path):
+    data = [{"url": "https://www.ptt.cc/bbs/X/index.html", "keywords": []}]
+
+    with pytest.raises(ConfigError):
+        load_watches(write_watches(tmp_path, data))
+
+
+def test_load_watches_invalid_mode_raises(tmp_path):
+    data = [
+        {
+            "url": "https://www.ptt.cc/bbs/X/index.html",
+            "keywords": ["x"],
+            "mode": "both",
+        }
+    ]
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_watches(write_watches(tmp_path, data))
+
+    assert "mode" in str(exc_info.value)
+
+
+# --- match_title ---
+
+
+def test_match_title_any_mode_matches_one_keyword():
+    assert match_title("[徵求] 五月天 5/24 兩張", ["五月天", "告五人"], "any")
+
+
+def test_match_title_any_mode_no_keyword_matches():
+    assert not match_title("[售票] 告五人 6/01", ["五月天", "MAYDAY"], "any")
+
+
+def test_match_title_is_case_insensitive():
+    assert match_title("[請益] MAYDAY 演唱會問題", ["mayday"], "any")
+
+
+def test_match_title_all_mode_requires_every_keyword():
+    title = "[徵求] 五月天 5/24 兩張"
+
+    assert match_title(title, ["五月天", "徵求"], "all")
+    assert not match_title(title, ["五月天", "售票"], "all")
 
 
 # --- parse_posts ---
@@ -70,27 +190,29 @@ PAGE_HTML = """
 """
 
 
-def test_parse_posts_returns_matching_titles_with_full_links():
-    posts = parse_posts(PAGE_HTML, "五月天")
+def test_parse_posts_returns_all_posts_with_full_links():
+    posts = parse_posts(PAGE_HTML)
 
     assert posts == [
         (
             "[徵求] 五月天 5/24 場次兩張",
             "https://www.ptt.cc/bbs/Drama-Ticket/M.111.A.AAA.html",
-        )
+        ),
+        (
+            "[售票] 告五人 6/01",
+            "https://www.ptt.cc/bbs/Drama-Ticket/M.222.A.BBB.html",
+        ),
+        (
+            "[請益] MAYDAY 演唱會問題",
+            "https://www.ptt.cc/bbs/Drama-Ticket/M.333.A.CCC.html",
+        ),
     ]
 
 
-def test_parse_posts_matches_keyword_case_insensitively():
-    posts = parse_posts(PAGE_HTML, "mayday")
-
-    assert [title for title, _ in posts] == ["[請益] MAYDAY 演唱會問題"]
-
-
 def test_parse_posts_skips_deleted_posts_without_crashing():
-    posts = parse_posts(PAGE_HTML, "本文已被刪除")
+    posts = parse_posts(PAGE_HTML)
 
-    assert posts == []
+    assert all("本文已被刪除" not in title for title, _ in posts)
 
 
 # --- SeenStore ---
@@ -127,8 +249,6 @@ def test_seen_store_writes_valid_json_list(tmp_path):
 
 # --- render_email ---
 
-from main import board_from_url, render_email  # noqa: E402
-
 POSTS = [
     ("[徵求] 五月天 5/24 場次兩張", "https://www.ptt.cc/bbs/Drama-Ticket/M.111.A.AAA.html"),
     ("[售票] 五月天 6/01 兩張原價", "https://www.ptt.cc/bbs/Drama-Ticket/M.222.A.BBB.html"),
@@ -143,14 +263,14 @@ def test_board_from_url_falls_back_to_empty_string():
     assert board_from_url("https://example.com/whatever") == ""
 
 
-def test_render_email_subject_mentions_count_and_keyword():
-    subject, _, _ = render_email("五月天", POSTS, checked_at="2026-07-07 10:15")
+def test_render_email_subject_mentions_watch_name_and_count():
+    subject, _, _ = render_email("五月天票券", POSTS, checked_at="2026-07-07 10:15")
 
-    assert subject == "搜尋到 2 篇【五月天】相關標題文章"
+    assert subject == "【五月天票券】搜尋到 2 篇新文章"
 
 
 def test_render_email_text_fallback_contains_titles_and_links():
-    _, text, _ = render_email("五月天", POSTS, checked_at="2026-07-07 10:15")
+    _, text, _ = render_email("五月天票券", POSTS, checked_at="2026-07-07 10:15")
 
     for title, url in POSTS:
         assert title in text
@@ -158,7 +278,7 @@ def test_render_email_text_fallback_contains_titles_and_links():
 
 
 def test_render_email_html_links_titles_and_shows_board():
-    _, _, html = render_email("五月天", POSTS, checked_at="2026-07-07 10:15")
+    _, _, html = render_email("五月天票券", POSTS, checked_at="2026-07-07 10:15")
 
     assert '<a href="https://www.ptt.cc/bbs/Drama-Ticket/M.111.A.AAA.html"' in html
     assert "[徵求] 五月天 5/24 場次兩張" in html
@@ -173,3 +293,52 @@ def test_render_email_escapes_html_in_titles():
 
     assert "<b>" not in html
     assert "&lt;b&gt;五月天 &amp; Friends&lt;/b&gt;" in html
+
+
+# --- run_cycle ---
+
+
+def test_run_cycle_fetches_each_url_once_and_notifies_per_watch(monkeypatch, tmp_path):
+    url = "https://www.ptt.cc/bbs/Drama-Ticket/index.html"
+    fetched = []
+    monkeypatch.setattr(
+        main_mod, "fetch_page", lambda session, u: (fetched.append(u), PAGE_HTML)[1]
+    )
+    sent = []
+    monkeypatch.setattr(
+        main_mod,
+        "send_email",
+        lambda config, subject, text, html: sent.append(subject),
+    )
+
+    config = Config.from_env(REQUIRED_ENV)
+    watches = [
+        Watch(name="五月天", url=url, keywords=["五月天"], mode="any"),
+        Watch(name="MAYDAY", url=url, keywords=["mayday"], mode="any"),
+    ]
+    store = SeenStore(tmp_path / "seen.json")
+
+    run_cycle(config, watches, None, store)
+
+    assert fetched == [url]
+    assert sent == ["【五月天】搜尋到 1 篇新文章", "【MAYDAY】搜尋到 1 篇新文章"]
+
+
+def test_run_cycle_does_not_renotify_seen_posts(monkeypatch, tmp_path):
+    url = "https://www.ptt.cc/bbs/Drama-Ticket/index.html"
+    monkeypatch.setattr(main_mod, "fetch_page", lambda session, u: PAGE_HTML)
+    sent = []
+    monkeypatch.setattr(
+        main_mod,
+        "send_email",
+        lambda config, subject, text, html: sent.append(subject),
+    )
+
+    config = Config.from_env(REQUIRED_ENV)
+    watches = [Watch(name="五月天", url=url, keywords=["五月天"], mode="any")]
+    store = SeenStore(tmp_path / "seen.json")
+
+    run_cycle(config, watches, None, store)
+    run_cycle(config, watches, None, store)
+
+    assert len(sent) == 1
