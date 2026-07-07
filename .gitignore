@@ -1,0 +1,17 @@
+# 虛擬環境
+venv/
+path/
+
+# 環境變數（含密碼，不可 commit）
+.env
+
+# 執行時產生的狀態檔
+seen_posts.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# macOS
+.DS_Store
