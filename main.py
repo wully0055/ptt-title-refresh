@@ -23,6 +23,15 @@ DEFAULT_SEEN_POSTS_FILE = "seen_posts.json"
 DEFAULT_WATCHES_FILE = "watches.json"
 WATCH_MODES = ("any", "all")
 
+# 模擬瀏覽器，避免被伺服器以預設 python-requests UA 擋掉或重設連線
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
+FETCH_MAX_ATTEMPTS = 3
+FETCH_RETRY_BASE_DELAY_SECONDS = 2  # 退避基準：第 n 次重試等待 base * 2^(n-1) 秒
+
 logger = logging.getLogger(__name__)
 
 
@@ -178,13 +187,43 @@ def parse_posts(html: str) -> list[tuple[str, str]]:
 
 
 def fetch_page(session: requests.Session, url: str) -> str | None:
-    try:
-        response = session.get(url, timeout=30)
-        response.raise_for_status()
-        return response.text
-    except requests.exceptions.RequestException:
-        logger.error("抓取頁面失敗 url=%s", url, exc_info=True)
-        return None
+    """抓取頁面，遇到暫時性錯誤時以指數退避重試，全部失敗才回傳 None。
+
+    4xx 屬於設定錯誤（例如網址打錯）而非暫時性問題，不重試。
+    """
+    for attempt in range(1, FETCH_MAX_ATTEMPTS + 1):
+        try:
+            response = session.get(url, timeout=30)
+            response.raise_for_status()
+            return response.text
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status is not None and status < 500:
+                logger.error("抓取頁面失敗（HTTP %s，不重試）url=%s", status, url)
+                return None
+            error = e
+        except requests.exceptions.RequestException as e:
+            error = e
+
+        if attempt < FETCH_MAX_ATTEMPTS:
+            delay = FETCH_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+            logger.warning(
+                "抓取頁面失敗（%s），%d 秒後重試（第 %d/%d 次）url=%s",
+                error,
+                delay,
+                attempt,
+                FETCH_MAX_ATTEMPTS,
+                url,
+            )
+            time.sleep(delay)
+        else:
+            logger.error(
+                "抓取頁面失敗，已重試 %d 次仍失敗 url=%s",
+                FETCH_MAX_ATTEMPTS,
+                url,
+                exc_info=error,
+            )
+    return None
 
 
 def board_from_url(url: str) -> str:
@@ -322,6 +361,7 @@ def main() -> None:
 
     store = SeenStore(config.seen_posts_file)
     session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
     session.cookies.set("over18", "1", domain=".ptt.cc")  # 18 禁看板的年齡確認
 
     for watch in watches:

@@ -1,6 +1,8 @@
 import json
+import logging
 
 import pytest
+import requests
 
 import main as main_mod
 from main import (
@@ -9,6 +11,7 @@ from main import (
     SeenStore,
     Watch,
     board_from_url,
+    fetch_page,
     load_watches,
     match_title,
     parse_posts,
@@ -342,3 +345,99 @@ def test_run_cycle_does_not_renotify_seen_posts(monkeypatch, tmp_path):
     run_cycle(config, watches, None, store)
 
     assert len(sent) == 1
+
+
+# --- fetch_page ---
+
+
+class FakeResponse:
+    def __init__(self, text="", status=200):
+        self.text = text
+        self.status_code = status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(
+                f"HTTP {self.status_code}", response=self
+            )
+
+
+class FakeSession:
+    """依序回傳 outcomes 裡的結果；Exception 會被 raise。"""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def get(self, url, timeout):
+        self.calls += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+@pytest.fixture
+def sleeps(monkeypatch):
+    recorded = []
+    monkeypatch.setattr(main_mod.time, "sleep", recorded.append)
+    return recorded
+
+
+def test_fetch_page_returns_text_on_success(sleeps):
+    session = FakeSession([FakeResponse("page content")])
+
+    assert fetch_page(session, "https://www.ptt.cc/bbs/X/index.html") == "page content"
+    assert sleeps == []
+
+
+def test_fetch_page_retries_connection_error_with_backoff(sleeps):
+    session = FakeSession(
+        [
+            requests.exceptions.ConnectionError("Connection reset by peer"),
+            FakeResponse("recovered"),
+        ]
+    )
+
+    assert fetch_page(session, "https://www.ptt.cc/bbs/X/index.html") == "recovered"
+    assert session.calls == 2
+    assert sleeps == [2]
+
+
+def test_fetch_page_gives_up_after_max_attempts(sleeps):
+    session = FakeSession(
+        [requests.exceptions.ConnectionError("reset")] * 3
+    )
+
+    assert fetch_page(session, "https://www.ptt.cc/bbs/X/index.html") is None
+    assert session.calls == 3
+    assert sleeps == [2, 4]
+
+
+def test_fetch_page_retries_server_errors(sleeps):
+    session = FakeSession([FakeResponse(status=503), FakeResponse("recovered")])
+
+    assert fetch_page(session, "https://www.ptt.cc/bbs/X/index.html") == "recovered"
+    assert session.calls == 2
+
+
+def test_fetch_page_does_not_retry_client_http_errors(sleeps):
+    session = FakeSession([FakeResponse(status=404), FakeResponse("never reached")])
+
+    assert fetch_page(session, "https://www.ptt.cc/bbs/X/index.html") is None
+    assert session.calls == 1
+    assert sleeps == []
+
+
+def test_fetch_page_retry_warning_includes_failure_reason(sleeps, caplog):
+    session = FakeSession(
+        [
+            requests.exceptions.ConnectionError("Connection reset by peer"),
+            FakeResponse("recovered"),
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        fetch_page(session, "https://www.ptt.cc/bbs/X/index.html")
+
+    assert "Connection reset by peer" in caplog.text
